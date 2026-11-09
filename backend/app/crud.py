@@ -1,0 +1,114 @@
+import uuid
+from typing import Any
+
+from sqlmodel import Session, select
+
+from app.core.security import get_password_hash, verify_password
+from app.models import Item, ItemCreate, User, UserCreate, UserRole, UserUpdate
+
+
+def _sync_role_and_superuser(
+    data: dict[str, Any],
+    *,
+    fields_set: set[str],
+    current_role: UserRole | None,
+) -> None:
+    if "role" in fields_set and isinstance(data.get("role"), UserRole):
+        data["is_superuser"] = data["role"] == UserRole.admin
+        return
+    if "role" in fields_set:
+        data.pop("role", None)
+
+    if "is_superuser" in fields_set and isinstance(data.get("is_superuser"), bool):
+        if data["is_superuser"]:
+            data["role"] = UserRole.admin
+            return
+        if current_role == UserRole.manager:
+            data["role"] = UserRole.manager
+            data["is_superuser"] = False
+            return
+        data["role"] = UserRole.member
+        data["is_superuser"] = False
+        return
+    if "is_superuser" in fields_set:
+        data.pop("is_superuser", None)
+
+    if current_role is None:
+        data["role"] = UserRole.member
+        data["is_superuser"] = False
+
+
+def create_user(*, session: Session, user_create: UserCreate) -> User:
+    role_data: dict[str, Any] = {
+        "role": user_create.role,
+        "is_superuser": user_create.is_superuser,
+    }
+    _sync_role_and_superuser(
+        role_data,
+        fields_set=set(user_create.model_fields_set),
+        current_role=None,
+    )
+    db_obj = User.model_validate(
+        user_create,
+        update={
+            "hashed_password": get_password_hash(user_create.password),
+            "role": role_data["role"],
+            "is_superuser": role_data["is_superuser"],
+        },
+    )
+    session.add(db_obj)
+    session.commit()
+    session.refresh(db_obj)
+    return db_obj
+
+
+def update_user(*, session: Session, db_user: User, user_in: UserUpdate) -> Any:
+    user_data = user_in.model_dump(exclude_unset=True)
+    _sync_role_and_superuser(
+        user_data,
+        fields_set=set(user_in.model_fields_set),
+        current_role=db_user.role,
+    )
+    extra_data = {}
+    if "password" in user_data:
+        password = user_data["password"]
+        hashed_password = get_password_hash(password)
+        extra_data["hashed_password"] = hashed_password
+    db_user.sqlmodel_update(user_data, update=extra_data)
+    session.add(db_user)
+    session.commit()
+    session.refresh(db_user)
+    return db_user
+
+
+def get_user_by_email(*, session: Session, email: str) -> User | None:
+    statement = select(User).where(User.email == email)
+    session_user = session.exec(statement).first()
+    return session_user
+
+
+DUMMY_HASH = "$argon2id$v=19$m=65536,t=3,p=4$MjQyZWE1MzBjYjJlZTI0Yw$YTU4NGM5ZTZmYjE2NzZlZjY0ZWY3ZGRkY2U2OWFjNjk"
+
+
+def authenticate(*, session: Session, email: str, password: str) -> User | None:
+    db_user = get_user_by_email(session=session, email=email)
+    if not db_user:
+        verify_password(password, DUMMY_HASH)
+        return None
+    verified, updated_password_hash = verify_password(password, db_user.hashed_password)
+    if not verified:
+        return None
+    if updated_password_hash:
+        db_user.hashed_password = updated_password_hash
+        session.add(db_user)
+        session.commit()
+        session.refresh(db_user)
+    return db_user
+
+
+def create_item(*, session: Session, item_in: ItemCreate, owner_id: uuid.UUID) -> Item:
+    db_item = Item.model_validate(item_in, update={"owner_id": owner_id})
+    session.add(db_item)
+    session.commit()
+    session.refresh(db_item)
+    return db_item
